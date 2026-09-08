@@ -10,10 +10,13 @@ if str(ROOT_DIR) not in sys.path:
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.settings import get_settings
 from app.routes.analyse import router as analyse_router
 from app.routes.health import router as health_router
 from app.routes.time import router as time_router
 
+
+settings = get_settings()
 
 app = FastAPI(
     title="Anthos AI Server",
@@ -21,10 +24,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Enable CORS for frontend clients (e.g., anthos.web)
+# Enable CORS restricted to anthosweb URL from env
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
