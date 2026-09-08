@@ -36,3 +36,5 @@ app.add_middleware(
 app.include_router(health_router, tags=["Health"])
 app.include_router(time_router, tags=["Time"])
 app.include_router(analyse_router, tags=["Analyse"])
+
+main = app
