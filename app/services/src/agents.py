@@ -1,0 +1,156 @@
+import logging
+
+from langchain.chat_models import init_chat_model
+
+from app.settings import get_settings
+from app.schemas import ModelDetail
+from app.services.src.prompt_template import (
+    CATEGORIZE_EMAIL_PROMPT,
+    SUPERVISOR_EMAIL_VERIFICATION_PROMPT,
+    few_shot_prompt,ChatPromptTemplate
+)
+from app.services.src.state import CategorizeEmailOutput, SupervisorOutput
+
+
+
+
+logger = logging.getLogger(__name__)
+
+import re
+
+
+PROVIDER_MAP = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "google": "google_genai",
+    "amazon bedrock": "bedrock_converse",
+    "openrouter": "openrouter",
+    "perplexity": "perplexity",
+    "nvidia": "nvidia",
+    "groq": "groq",
+    "ollama": "ollama",
+    "deepseek": "deepseek",
+}
+
+
+def normalize_provider(provider: str) -> str:
+    provider = provider.strip().lower()
+
+    if provider not in PROVIDER_MAP:
+        raise ValueError(f"Unsupported provider: {provider}")
+
+    return PROVIDER_MAP[provider]
+
+
+
+class Agent:
+        
+    def __init__(self, model_detail: ModelDetail, email_count: int):
+
+        settings = get_settings()
+
+
+        self.default_value = model_detail.default
+
+        if self.default_value  and email_count <= 10:
+            # Use system default model
+            self.model_name = "gemma-4-26b-a4b-it"
+            self.model_provider = "google-genai"
+            self.model_llm_api_key = settings.GOOGLE_API_KEY
+
+        else:
+            # Use requested model
+            self.model_name = model_detail.name
+            self.model_provider = normalize_provider(model_detail.provider)
+            self.model_llm_api_key = model_detail.api_key 
+            
+        
+
+        #classification agent
+
+        
+        try:
+            
+            if not self.model_llm_api_key:
+                    raise ValueError("LLM_API_KEY is not set in the environment")
+
+            
+            llm = init_chat_model(model = self.model_name, model_provider = self.model_provider,api_key=self.model_llm_api_key)
+            print("llm",self.model_name)
+            
+            email_category_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        CATEGORIZE_EMAIL_PROMPT
+                    ),
+
+                    # inserts all examples
+                    few_shot_prompt,
+
+                    (
+                        "human",
+                        """
+            
+
+            # EMAIL SUBJECT
+            {cleaned_subject}
+
+            # EMAIL BODY
+            {cleaned_body}
+
+             # Available Categories with their category name, category description, category examples:
+            
+            {category_info}
+
+            # Supervisor Feedback:
+
+            {supervisor_feedback} 
+            """
+                    ),
+                ]
+            )
+
+            self.categorize_email = email_category_prompt | llm.with_structured_output(CategorizeEmailOutput,method='json_mode',include_raw=True)
+        except Exception:
+             logger.exception("Failed to initialize classification agent")
+             raise 
+
+
+        #supervisor agent
+
+        try:
+
+             
+            supervisor_key = settings.GOOGLE_API_KEY
+            if not supervisor_key:
+                  raise ValueError("SUPERVISOR_API_KEY is not set")
+
+            
+             
+            suppervisor_llm = init_chat_model(model="gemini-3.5-flash-lite",model_provider="google-genai",api_key=supervisor_key)
+            print("supervisor" ,suppervisor_llm.model)
+            supervisor_prompt = ChatPromptTemplate.from_messages([("system",SUPERVISOR_EMAIL_VERIFICATION_PROMPT),("human", """# Available Categories
+
+                                                                                                                                {category_info}
+
+                                                                                                                                # EMAIL SUBJECT
+
+                                                                                                                                {cleaned_subject}
+
+                                                                                                                                # EMAIL BODY
+
+                                                                                                                                {cleaned_body}
+
+                                                                                                                                # Classification Agent Output
+
+                                                                                                                                Predicted Category: {predicted_category}
+
+                                                                                                                                Confidence Score: {confidence_score}
+
+                                                                                                                                Priority Score: {priority_score}""")])
+            self.supervise_email = supervisor_prompt | suppervisor_llm.with_structured_output(SupervisorOutput,method='json_mode',include_raw=True)
+
+        except Exception:
+            logger.exception("Failed to initialize the supervisor agent")
+            raise
