@@ -1,4 +1,8 @@
-# Anthos AI Server
+<p align="center">
+  <img src="https://anthos-opensource.vercel.app/anthos-banner.png" alt="Anthos Banner" width="100%" />
+</p>
+
+# Anthos AI
 
 An intelligent, multi-agent email categorization, summarization, and priority scoring engine built with **FastAPI**, **LangGraph**, **LangChain**, and **PostgreSQL/Supabase**.
 
