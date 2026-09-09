@@ -76,7 +76,7 @@ class Agent:
 
             
             llm = init_chat_model(model = self.model_name, model_provider = self.model_provider,api_key=self.model_llm_api_key)
-            print("llm",self.model_name)
+            logger.info("Initialized classification LLM: %s (provider: %s)", self.model_name, self.model_provider)
             
             email_category_prompt = ChatPromptTemplate.from_messages(
                 [
@@ -129,7 +129,7 @@ class Agent:
             
              
             suppervisor_llm = init_chat_model(model="gemini-3.5-flash-lite",model_provider="google-genai",api_key=supervisor_key)
-            print("supervisor" ,suppervisor_llm.model)
+            logger.info("Initialized supervisor LLM: gemini-3.5-flash-lite")
             supervisor_prompt = ChatPromptTemplate.from_messages([("system",SUPERVISOR_EMAIL_VERIFICATION_PROMPT),("human", """# Available Categories
 
                                                                                                                                 {category_info}
