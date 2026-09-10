@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import contextmanager
+import json
 import logging
 from typing import Generator
 
@@ -23,26 +24,48 @@ workflow = EmailWorkflow()
 settings = get_settings()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: Origin check against ANTHOSWEB_URL
+# ─────────────────────────────────────────────────────────────────────────────
 def is_origin_allowed(origin: str | None) -> bool:
     """
-    Check whether the WebSocket client's Origin is permitted based on ANTHOSWEB_URL.
-
-    If the origin header is omitted (e.g. CLI tools, unit tests), it is allowed.
-    If present, it must match one of the allowed origins configured in settings.cors_origins.
+    Check whether the WebSocket client's Origin header is allowed.
+    If origin is absent (CLI tools, tests), it is allowed.
+    If present, it must match one of the settings.cors_origins entries.
     """
     if not origin:
         return True
-    allowed_origins = settings.cors_origins
-    if "*" in allowed_origins:
+    allowed = settings.cors_origins
+    if "*" in allowed:
         return True
-    return origin.strip().rstrip("/") in allowed_origins
+    return origin.strip().rstrip("/") in allowed
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: safe send that swallows errors if the connection is already closed
+# ─────────────────────────────────────────────────────────────────────────────
+async def safe_send_json(websocket: WebSocket, data: dict) -> bool:
+    """
+    Attempt to send JSON over WebSocket. Returns True on success, False if
+    the connection is already closed (swallows RuntimeError / disconnect).
+    This prevents the 'Cannot call send once a close message has been sent' crash.
+    """
+    try:
+        await websocket.send_json(data)
+        return True
+    except (RuntimeError, WebSocketDisconnect):
+        # Connection already closed — nothing to send to
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: database session for WebSocket (cannot use FastAPI Depends)
+# ─────────────────────────────────────────────────────────────────────────────
 @contextmanager
 def get_db_session() -> Generator[Session, None, None]:
     """
-    Safely manage a database session lifecycle for WebSocket requests.
-    Guarantees session closure upon exiting the context block, preventing connection pool leaks.
+    Context manager for a database session outside of FastAPI Depends.
+    Guarantees the session is closed when the block exits.
     """
     db_gen = get_db()
     db = next(db_gen)
@@ -55,13 +78,15 @@ def get_db_session() -> Generator[Session, None, None]:
             pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared analysis logic used by both WebSocket and HTTP POST
+# ─────────────────────────────────────────────────────────────────────────────
 async def execute_email_analysis(payload: AnalyseRequest, db: Session) -> list[dict]:
     """
-    Core business logic to analyze a batch of emails:
-    1. Fetches user categories from the database.
-    2. Resolves model configuration (custom model from DB or payload details).
-    3. Runs the multi-agent LangGraph workflow.
+    Core business logic — fetches categories from DB, resolves the model,
+    and runs the LangGraph workflow.  Shared by WS and HTTP handlers.
     """
+    # Fetch all user-defined categories from the database
     db_categories = db.query(Category).all()
     categories = [
         CategoryDetail(
@@ -73,6 +98,7 @@ async def execute_email_analysis(payload: AnalyseRequest, db: Session) -> list[d
         for cat in db_categories
     ]
 
+    # Look up the model in the database (by id or name)
     db_model = (
         db.query(Model)
         .filter((Model.id == payload.model.id) | (Model.name == payload.model.name))
@@ -97,6 +123,7 @@ async def execute_email_analysis(payload: AnalyseRequest, db: Session) -> list[d
             setting_id=payload.model.setting_id,
         )
 
+    # Run the multi-agent LangGraph workflow
     results = await workflow.gather_emails(
         incoming_emails=payload.emails,
         incoming_user_defined_categories=categories,
@@ -105,162 +132,181 @@ async def execute_email_analysis(payload: AnalyseRequest, db: Session) -> list[d
     return results
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket endpoint — ONE request per connection, no looping
+# ─────────────────────────────────────────────────────────────────────────────
 @router.websocket("/analyse")
+@router.websocket("/analyze")
 async def websocket_analyse(websocket: WebSocket) -> None:
     """
-    WebSocket endpoint for real-time email batch analysis on /analyse.
+    WebSocket endpoint for real-time email analysis on /analyse.
 
-    Protocol:
-    1. Origin Validation: Confirms incoming request Origin matches ANTHOSWEB_URL.
-    2. Connection: Accepts the WebSocket handshake.
-    3. Request Receipt & Immediate Confirmation:
-       - Client sends JSON matching AnalyseRequest.
-       - Server immediately sends a confirmation frame:
-         {"type": "confirmation", "status": "confirmed", "message": "...", "email_count": N}
-    4. Real-Time Log Streaming:
-       - Binds current_log_queue ContextVar for the current task.
-       - All console logs emitted during processing (cleaning, regex, LLM categorization,
-         supervisor verification, retries, summary) are forwarded live to the frontend:
-         {"type": "log", "status": "processing", "level": "INFO", "message": "...", "timestamp": "..."}
-    5. Final Completion:
-       - Sends {"type": "complete", "status": "completed", "results": [...]}
-    6. Error Handling:
-       - If an error occurs, sends {"type": "error", "status": "error", "message": "...", "detail": "..."}
+    Lifecycle (exactly ONE request per connection):
+      1. Origin check against ANTHOSWEB_URL → reject with 1008 if unauthorized.
+      2. Accept the handshake.
+      3. Wait for exactly ONE JSON message (AnalyseRequest).
+      4. Send immediate confirmation.
+      5. Stream real-time log messages as the LangGraph pipeline runs.
+      6. Send final results (type: "complete").
+      7. Close the WebSocket cleanly.
     """
+
+    # ── Step 0: origin verification ──────────────────────────────────────
     origin = websocket.headers.get("origin")
     if not is_origin_allowed(origin):
-        logger.warning(
-            "Rejected WebSocket connection from unauthorized origin: %s (allowed: %s)",
-            origin,
-            settings.cors_origins,
+        logger.warning("Rejected WS from unauthorized origin: %s", origin)
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION, reason="Origin not allowed"
         )
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Origin not allowed")
         return
 
+    # ── Step 1: accept connection ────────────────────────────────────────
     await websocket.accept()
-    logger.info("WebSocket /analyse connection accepted from origin: %s", origin or "direct/test")
+    logger.info("WebSocket /analyse accepted (origin: %s)", origin or "direct")
 
     try:
-        while True:
-            # Receive analysis request payload
-            try:
-                raw_message = await websocket.receive_text()
-            except WebSocketDisconnect:
-                logger.info("WebSocket /analyse client disconnected")
-                break
-            except Exception as e:
-                logger.warning("Error receiving message from WebSocket: %s", e)
-                break
+        # ── Step 2: receive exactly ONE request ──────────────────────────
+        try:
+            raw_message = await websocket.receive_text()
+        except WebSocketDisconnect:
+            logger.info("Client disconnected before sending payload")
+            return
 
-            # Parse and validate incoming payload
-            try:
-                payload = AnalyseRequest.model_validate_json(raw_message)
-            except ValidationError as val_err:
-                logger.warning("Invalid payload received on WebSocket: %s", val_err)
-                await websocket.send_json({
-                    "type": "error",
-                    "status": "error",
-                    "message": "Invalid request payload format",
-                    "detail": val_err.errors(),
-                })
-                continue
-            except Exception as json_err:
-                logger.warning("Malformed JSON received on WebSocket: %s", json_err)
-                await websocket.send_json({
-                    "type": "error",
-                    "status": "error",
-                    "message": "Malformed JSON payload",
-                    "detail": str(json_err),
-                })
-                continue
-
-            # Step 1: Immediately confirm receipt and start of processing
-            await websocket.send_json({
-                "type": "confirmation",
-                "status": "confirmed",
-                "message": f"Analysis request confirmed for {len(payload.emails)} email(s). Processing started.",
-                "email_count": len(payload.emails),
-                "model_name": payload.model.name,
+        # ── Step 3: validate the payload ─────────────────────────────────
+        try:
+            payload = AnalyseRequest.model_validate_json(raw_message)
+        except (ValidationError, ValueError, json.JSONDecodeError) as err:
+            logger.warning("Invalid payload on WebSocket: %s", err)
+            await safe_send_json(websocket, {
+                "type": "error",
+                "status": "error",
+                "message": "Invalid request payload",
+                "detail": str(err),
             })
-            logger.info("Confirmed analysis request for %d email(s)", len(payload.emails))
+            return
 
-            # Step 2: Set up real-time log queue bound to this request context
-            log_queue: asyncio.Queue = asyncio.Queue()
-            token = current_log_queue.set(log_queue)
+        # ── Step 4: immediate confirmation ───────────────────────────────
+        sent = await safe_send_json(websocket, {
+            "type": "confirmation",
+            "status": "confirmed",
+            "message": f"Analysis confirmed for {len(payload.emails)} email(s). Processing started.",
+            "email_count": len(payload.emails),
+            "model_name": payload.model.name,
+        })
+        if not sent:
+            logger.info("Client disconnected right after sending payload")
+            return
 
-            async def stream_logs_to_client() -> None:
-                """Stream queued log records live over the WebSocket."""
-                try:
-                    while True:
-                        log_item = await log_queue.get()
-                        if log_item is None:
-                            # Sentinel indicating processing finished
-                            log_queue.task_done()
-                            break
-                        await websocket.send_json(log_item)
-                        log_queue.task_done()
-                except (WebSocketDisconnect, RuntimeError):
-                    # Connection closed by client during streaming
-                    pass
-                except Exception as stream_err:
-                    logger.debug("Log streaming encountered error: %s", stream_err)
+        logger.info("Confirmed analysis for %d email(s)", len(payload.emails))
 
-            log_streamer_task = asyncio.create_task(stream_logs_to_client())
+        # ── Step 5: bind log queue + start log streamer ──────────────────
+        log_queue: asyncio.Queue = asyncio.Queue()
+        token = current_log_queue.set(log_queue)
 
-            # Step 3: Execute the analysis workflow and stream logs
+        # Flag to track if connection is still alive
+        connection_alive = True
+
+        async def stream_logs() -> None:
+            """Forward queued log items to the WebSocket until sentinel None."""
+            nonlocal connection_alive
             try:
-                with get_db_session() as db:
-                    results = await execute_email_analysis(payload=payload, db=db)
+                while True:
+                    item = await log_queue.get()
+                    if item is None:
+                        # Sentinel — processing is done
+                        log_queue.task_done()
+                        break
+                    if connection_alive:
+                        ok = await safe_send_json(websocket, item)
+                        if not ok:
+                            connection_alive = False
+                    log_queue.task_done()
+            except Exception:
+                # Silently stop streaming if anything goes wrong
+                connection_alive = False
 
-                # Wait for all buffered logs to finish streaming
-                await log_queue.put(None)
-                await log_streamer_task
+        log_task = asyncio.create_task(stream_logs())
 
-                # Step 4: Send the final completed analysis results
-                await websocket.send_json({
+        # ── Step 6: run the analysis ─────────────────────────────────────
+        try:
+            with get_db_session() as db:
+                results = await execute_email_analysis(payload=payload, db=db)
+
+            # Signal the log streamer to finish and wait for it
+            await log_queue.put(None)
+            await log_task
+
+            # ── Step 7: send final results ───────────────────────────────
+            if connection_alive:
+                await safe_send_json(websocket, {
                     "type": "complete",
                     "status": "completed",
                     "results": results,
                 })
-                logger.info(
-                    "Completed and delivered analysis results for %d email(s) over WebSocket",
-                    len(payload.emails),
-                )
+                logger.info("Delivered results for %d email(s) over WS", len(payload.emails))
 
-            except Exception as proc_err:
-                logger.exception("Error executing email analysis on WebSocket: %s", proc_err)
-                # Ensure streamer task cleanly completes
-                await log_queue.put(None)
-                if not log_streamer_task.done():
-                    await log_streamer_task
-
-                await websocket.send_json({
+        except Exception as exc:
+            logger.exception("Analysis failed on WebSocket: %s", exc)
+            # Stop log streamer
+            await log_queue.put(None)
+            if not log_task.done():
+                await log_task
+            # Try to notify the client
+            if connection_alive:
+                await safe_send_json(websocket, {
                     "type": "error",
                     "status": "error",
                     "message": "Failed to analyze emails",
-                    "detail": str(proc_err),
+                    "detail": str(exc),
                 })
-            finally:
-                # Reset contextvar token to prevent queue leakage
-                current_log_queue.reset(token)
+        finally:
+            # Always reset the context var to avoid leaking the queue
+            current_log_queue.reset(token)
 
     except WebSocketDisconnect:
-        logger.info("WebSocket /analyse connection closed")
+        logger.info("WebSocket /analyse connection closed by client")
     except Exception as exc:
-        logger.exception("Unexpected error in WebSocket /analyse handler: %s", exc)
+        logger.exception("Unexpected error in WS /analyse: %s", exc)
+    finally:
+        # ── Step 8: close the connection from server side ────────────────
+        # This ensures the frontend knows the transaction is done and
+        # prevents it from thinking the connection is still open.
+        try:
+            await websocket.close()
+        except Exception:
+            pass  # Already closed — that's fine
 
 
-@router.post("/analyse", response_model=AnalyseResponse, summary="Analyse a batch of emails (HTTP Fallback)")
-async def analyse(payload: AnalyseRequest, db: Session = Depends(get_db)) -> AnalyseResponse:
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP POST endpoint — fallback for non-WebSocket clients
+# ─────────────────────────────────────────────────────────────────────────────
+@router.post(
+    "/analyze",
+    response_model=AnalyseResponse,
+    summary="Analyze a batch of emails",
+)
+@router.post(
+    "/analyse",
+    response_model=AnalyseResponse,
+    summary="Analyse a batch of emails",
+    include_in_schema=False,
+)
+async def analyze(
+    payload: AnalyseRequest, db: Session = Depends(get_db)
+) -> AnalyseResponse:
     """
-    HTTP POST fallback endpoint for analyzing emails.
-    Maintains backward-compatibility with existing HTTP clients.
-    For live real-time progress updates, use the WebSocket endpoint at ws://.../analyse.
+    HTTP POST endpoint for email analysis.
+    Serves as fallback when WebSocket is unavailable.
     """
     try:
         results = await execute_email_analysis(payload=payload, db=db)
-    except Exception:
-        logger.exception("analyze_emails endpoint failed")
-        raise HTTPException(status_code=500, detail="Failed to analyze emails")
+        return AnalyseResponse(results=results)
+    except Exception as exc:
+        logger.exception("Analysis failed on HTTP POST: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Analysis failed: {str(exc)}",
+        )
 
-    return AnalyseResponse(results=results)
+
+

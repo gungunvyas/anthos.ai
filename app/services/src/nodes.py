@@ -11,13 +11,15 @@ logger = logging.getLogger(__name__)
 class EmailCleaner:
 
     def __init__(self):
+        pass  # parser is created fresh per call to avoid shared state issues
 
-
-       self.parser = html2text.HTML2Text()
-
-       self.parser.ignore_images = True
-       self.parser.ignore_links = True
-       self.parser.ignore_emphasis = True
+    def _make_parser(self) -> html2text.HTML2Text:
+        """Create a fresh html2text parser for each call (avoids shared state corruption)."""
+        parser = html2text.HTML2Text()
+        parser.ignore_images = True
+        parser.ignore_links = True
+        parser.ignore_emphasis = True
+        return parser
 
     def clean_subject_and_body(self,text:str) -> str:
 
@@ -25,11 +27,21 @@ class EmailCleaner:
             return ""
 
         decoded_text = text.encode("utf-16", "surrogatepass").decode("utf-16")
-        parsed_text = self.parser.handle(decoded_text)
+
+        # Try html2text first; fall back to regex strip if the parser
+        # crashes on malformed HTML (AssertionError on Python 3.14).
+        try:
+            parser = self._make_parser()
+            parsed_text = parser.handle(decoded_text)
+        except (AssertionError, Exception):
+            # Fallback: strip HTML tags with a simple regex
+            parsed_text = re.sub(r"<[^>]+>", " ", decoded_text)
+
         cleaned_text = re.sub(r"[^a-zA-Z0-9]+", " ", parsed_text)
         result = " ".join(cleaned_text.split())
 
         return result
+
 
 
 
@@ -67,10 +79,12 @@ class Nodes:
         logger.info("Running regex categorization for email %s", email.id)
 
         try:
+
+            sender_match = re.search(r"noreply|no-reply|donotreply", (email.sender or "").lower())
             promotional_newsletter_updates_match = re.search(r"unsubscribe|newsletter", (email.cleaned_body or "").lower())
 
-            if promotional_newsletter_updates_match:
-                
+            if sender_match or promotional_newsletter_updates_match:
+
                 email.category = "Others"
                 email.confidence_score = 1.0
                 email.priority_score = 1
