@@ -54,7 +54,7 @@ class Agent:
 
         if self.default_value  and email_count <= 10:
             # Use system default model
-            self.model_name = "gemma-4-26b-a4b-it"
+            self.model_name = "gemini-3.5-flash-lite"
             self.model_provider = "google-genai"
             self.model_llm_api_key = settings.GOOGLE_API_KEY
 
@@ -128,8 +128,8 @@ class Agent:
 
             
              
-            suppervisor_llm = init_chat_model(model="gemini-3.5-flash-lite",model_provider="google-genai",api_key=supervisor_key)
-            logger.info("Initialized supervisor LLM: gemini-3.5-flash-lite")
+            suppervisor_llm = init_chat_model(model="gemma-4-26b-a4b-it",model_provider="google-genai",api_key=supervisor_key)
+            logger.info("Initialized supervisor LLM: gemma-4-26b-a4b-it")
             supervisor_prompt = ChatPromptTemplate.from_messages([("system",SUPERVISOR_EMAIL_VERIFICATION_PROMPT),("human", """# Available Categories
 
                                                                                                                                 {category_info}

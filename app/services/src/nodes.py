@@ -72,43 +72,7 @@ class Nodes:
 
         return {"one_email": email}
 
-  
-    def regex_email_categorization(self,state: MainGraphState):
 
-        email = state["one_email"]
-        logger.info("Running regex categorization for email %s", email.id)
-
-        try:
-
-            sender_match = re.search(r"noreply|no-reply|donotreply", (email.sender or "").lower())
-            promotional_newsletter_updates_match = re.search(r"unsubscribe|newsletter", (email.cleaned_body or "").lower())
-
-            if sender_match or promotional_newsletter_updates_match:
-
-                email.category = "Others"
-                email.confidence_score = 1.0
-                email.priority_score = 1
-                logger.info("Email %s regex-classified as promotional_newsletter_updates", email.id)
-        except Exception:
-            logger.exception("Regex categorization failed for email %s, deferring to LLM", email.id)
-
-        return {"one_email": email}
-        
-        
-    
-    def regex_router(self,state: MainGraphState) -> str:
-
-        email = state["one_email"]
-
-        if email.category == "Others":
-            return "regex_classified"
-        else:
-            logger.info("Sending to LLM for classification")
-            return "send_to_llm"
-
-        
-        
-    
     def user_email_category_config(self,state:MainGraphState):
         
         user_dynamic_categories = state["user_defined_email_categories"] #list
